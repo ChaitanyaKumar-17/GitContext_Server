@@ -1,36 +1,42 @@
 """
 main.py
 ~~~~~~~
-GitContext MCP Server — M1: stdio transport
+GitContext MCP Server — M3: Streamable HTTP transport + Bearer-token auth
 
-Entry point for the FastMCP server. Registers all five tools and wires up
-structured logging so every tool call is traced with name, args, latency, and
-success/failure status.
+Switched from stdio (M1) to Streamable HTTP so the server can be deployed and
+reached over a real network connection (M4/M5).
 
-Run locally:
+Auth middleware:
+  Every request must carry:  Authorization: Bearer <MCP_BEARER_TOKEN>
+  Missing / invalid token  → 401 Unauthorized (structured JSON body)
+
+Run locally (HTTP mode):
     python -m server.main
 
-Add to Claude Desktop (mcp_servers in config.json):
-    {
-      "gitcontext": {
-        "command": "python",
-        "args": ["-m", "server.main"],
-        "cwd": "/path/to/GitContext_Server",
-        "env": {
-          "GITHUB_TOKEN": "ghp_...",
-          "MCP_BEARER_TOKEN": "your-secret"
-        }
-      }
+The server listens on PORT (env var, default 8000).
+
+Add to Claude Desktop as a REMOTE server (after deployment):
+  {
+    "gitcontext-remote": {
+      "type": "http",
+      "url": "https://<your-deployed-url>/mcp",
+      "headers": { "Authorization": "Bearer <MCP_BEARER_TOKEN>" }
     }
+  }
 """
 
 import logging
+import os
 import time
 from typing import Any
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
+from server.auth import verify_bearer_token
 from server.tools.repo_structure import get_repo_structure as _get_repo_structure
 from server.tools.search_code import search_code as _search_code
 from server.tools.read_file import read_file as _read_file
@@ -47,6 +53,44 @@ logging.basicConfig(
 )
 log = logging.getLogger("gitcontext")
 
+PORT = int(os.getenv("PORT", "8000"))
+
+
+# ── Auth middleware ────────────────────────────────────────────────────────────
+
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """
+    Rejects any request without a valid Bearer token with a clean 401.
+    Health-check path (/health) is exempt so deployment platforms can probe it.
+    """
+
+    EXEMPT_PATHS = {"/health"}
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in self.EXEMPT_PATHS:
+            return await call_next(request)
+
+        auth_header = request.headers.get("Authorization")
+        if not verify_bearer_token(auth_header):
+            log.warning(
+                "auth_rejected method=%s path=%s ip=%s",
+                request.method,
+                request.url.path,
+                request.client.host if request.client else "unknown",
+            )
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "unauthorized",
+                    "message": "Valid Bearer token required in Authorization header.",
+                },
+            )
+
+        return await call_next(request)
+
+
+# ── FastMCP app ────────────────────────────────────────────────────────────────
+
 mcp = FastMCP(
     name="GitContext Server",
     instructions=(
@@ -58,14 +102,14 @@ mcp = FastMCP(
 )
 
 
-# ── Logging decorator ─────────────────────────────────────────────────────────
+# ── Logging helper ─────────────────────────────────────────────────────────────
 
 def _log_tool(name: str, kwargs: dict, result: Any, latency_ms: int) -> None:
     status = "error" if isinstance(result, dict) and "error" in result else "ok"
     log.info(
         "tool=%s args=%s status=%s latency_ms=%d",
         name,
-        {k: v for k, v in kwargs.items()},
+        kwargs,
         status,
         latency_ms,
     )
@@ -73,7 +117,7 @@ def _log_tool(name: str, kwargs: dict, result: Any, latency_ms: int) -> None:
         log.warning("tool=%s error=%s", name, result.get("error"))
 
 
-# ── Tool registrations ────────────────────────────────────────────────────────
+# ── Tool registrations ─────────────────────────────────────────────────────────
 
 @mcp.tool(
     description=(
@@ -166,8 +210,47 @@ async def get_recent_commits(
     return result
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Build the ASGI app with auth middleware ────────────────────────────────────
+
+def build_app():
+    """
+    Returns the Starlette ASGI app with BearerAuthMiddleware wrapping the
+    FastMCP HTTP transport. Import this in Dockerfile / uvicorn.
+
+    FastMCP 4.x requires its lifespan to be forwarded to the parent Starlette
+    app so the StreamableHTTP session manager task group is initialised.
+    """
+    from starlette.applications import Starlette
+    from starlette.routing import Mount, Route
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    async def health(request):
+        return _JSONResponse({"status": "ok", "server": "GitContext MCP Server"})
+
+    mcp_app = mcp.http_app(path="/mcp")
+
+    # Parent app — must forward mcp_app.router.lifespan_context so FastMCP's
+    # session manager task group is started before requests arrive.
+    app = Starlette(
+        lifespan=mcp_app.router.lifespan_context,
+        routes=[
+            Route("/health", health),
+            Mount("/", app=mcp_app),
+        ],
+    )
+    # Add auth middleware to the parent app (wraps all routes including /mcp)
+    app.add_middleware(BearerAuthMiddleware)
+    return app
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    log.info("Starting GitContext MCP Server (stdio transport)")
-    mcp.run(transport="stdio")
+    import uvicorn
+
+    log.info("Starting GitContext MCP Server (HTTP transport) on port %d", PORT)
+    log.info("MCP endpoint: http://0.0.0.0:%d/mcp", PORT)
+    log.info("Health check: http://0.0.0.0:%d/health", PORT)
+
+    app = build_app()
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
