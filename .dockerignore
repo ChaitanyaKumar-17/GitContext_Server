@@ -1,0 +1,21 @@
+# ── Directories ──────────────────────────────────────────────────────────────
+.venv/
+.git/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+scratch/
+tests/
+
+# ── Dev files ─────────────────────────────────────────────────────────────────
+requirements-dev.txt
+.env
+*.env.local
+GitContext_Server.md
+
+# ── Editor / OS ───────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
